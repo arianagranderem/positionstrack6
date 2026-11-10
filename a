@@ -1,0 +1,1674 @@
+local Players = game:GetService('Players')
+local ReplicatedStorage = game:GetService('ReplicatedStorage')
+local RunService = game:GetService('RunService')
+local UserInputService = game:GetService('UserInputService')
+local TweenService = game:GetService('TweenService')
+local HttpService = game:GetService('HttpService')
+local Lighting = game:GetService('Lighting')
+
+local LocalPlayer = Players.LocalPlayer
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Direct module requires — no Fsys needed, works on Isaeva and any executor!
+local RS = ReplicatedStorage
+local ClientData        = require(RS.ClientModules.Core.ClientData)
+local RouterClient      = require(RS.ClientModules.Core.RouterClient.RouterClient)
+local UIManager         = require(RS.ClientModules.Core.UIManager.UIManager)
+local InventoryDB       = require(RS.ClientDB.Inventory.InventoryDB)
+local KindDB            = require(RS.ClientDB.Inventory.KindDB)
+local DownloadClient    = require(RS.ClientModules.Core.DownloadClient)
+local AnimationManager  = require(RS.ClientDB.AnimationManager)
+local PetRigs           = require(RS.new.modules.PetRigs)
+local AilmentsClient    = require(RS.new.modules.Ailments.AilmentsClient)
+local AilmentsDB        = require(RS.new.modules.Ailments.AilmentsDB)
+local CharWrapperClient = require(RS.ClientModules.Game.CharWrapperClient)
+
+_G.InventoryDB = InventoryDB
+
+-- Load PetAvatarItemDB for pet wear feature
+-- Load PetEntityManager so overhead UI (name, friendship bar) works on spawned pets
+local PetEntityManager = nil
+pcall(function()
+    PetEntityManager = require(RS.ClientModules.Game.PetEntities.PetEntityManager)
+end)
+
+local PetAvatarItemDB = nil
+pcall(function()
+    local db = require(game:GetService("ReplicatedStorage").ClientDB.PetAvatarItemDB)
+    if type(db) == "function" then db = db() end
+    PetAvatarItemDB = db
+end)
+
+local TradeHistoryApp = UIManager.apps.TradeHistoryApp
+local TradeApp = UIManager.apps.TradeApp
+local DialogApp = UIManager.apps.DialogApp
+local HintApp = UIManager.apps.HintApp
+
+
+if TradeHistoryApp._ORIGINAL_create_trade_frame then
+   TradeHistoryApp._create_trade_frame = TradeHistoryApp._ORIGINAL_create_trade_frame
+end
+if TradeApp._ORIGINAL_change_local_trade_state then
+   TradeApp._change_local_trade_state = TradeApp._ORIGINAL_change_local_trade_state
+end
+if TradeApp._ORIGINAL_overwrite_local_trade_state then
+   TradeApp._overwrite_local_trade_state = TradeApp._ORIGINAL_overwrite_local_trade_state
+end
+
+TradeHistoryApp._ORIGINAL_create_trade_frame = TradeHistoryApp._create_trade_frame
+TradeApp._ORIGINAL_change_local_trade_state = TradeApp._change_local_trade_state
+TradeApp._ORIGINAL_overwrite_local_trade_state = TradeApp._overwrite_local_trade_state
+
+local tradeCache = {}
+local currentTradeItems = nil
+
+function TradeApp._change_local_trade_state(self, changes, ...)
+   local currentState = TradeApp.local_trade_state
+
+   if currentState and currentState.trade_id then
+       local isSender = currentState.sender == LocalPlayer
+       local isRecipient = currentState.recipient == LocalPlayer
+
+       if isSender and changes.sender_offer and changes.sender_offer.items then
+           tradeCache[currentState.trade_id] = {
+               items = table.clone(changes.sender_offer.items),
+               isSender = true
+           }
+           currentTradeItems = changes.sender_offer.items
+       elseif isRecipient and changes.recipient_offer and changes.recipient_offer.items then
+           tradeCache[currentState.trade_id] = {
+               items = table.clone(changes.recipient_offer.items),
+               isSender = false
+           }
+           currentTradeItems = changes.recipient_offer.items
+       end
+   end
+
+   return TradeApp._ORIGINAL_change_local_trade_state(self, changes, ...)
+end
+
+function TradeApp._overwrite_local_trade_state(self, tradeState, ...)
+   if tradeState then
+       local isSender = tradeState.sender == LocalPlayer
+       local isRecipient = tradeState.recipient == LocalPlayer
+
+       if isSender and tradeState.sender_offer and currentTradeItems then
+           tradeState.sender_offer.items = currentTradeItems
+       elseif isRecipient and tradeState.recipient_offer and currentTradeItems then
+           tradeState.recipient_offer.items = currentTradeItems
+       end
+   else
+       currentTradeItems = nil
+       if TradeApp._last_trade_id then
+           tradeCache[TradeApp._last_trade_id] = nil
+           TradeApp._last_trade_id = nil
+       end
+   end
+
+   return TradeApp._ORIGINAL_overwrite_local_trade_state(self, tradeState, ...)
+end
+
+function TradeHistoryApp._create_trade_frame(self, tradeData, ...)
+   if tradeData.trade_id and tradeCache[tradeData.trade_id] then
+       local cachedData = tradeCache[tradeData.trade_id]
+       local modifiedData = table.clone(tradeData)
+
+       if cachedData.isSender then
+           modifiedData.sender_items = table.clone(cachedData.items)
+       else
+           modifiedData.recipient_items = table.clone(cachedData.items)
+       end
+
+       return TradeHistoryApp._ORIGINAL_create_trade_frame(self, modifiedData, ...)
+   end
+
+   return TradeHistoryApp._ORIGINAL_create_trade_frame(self, tradeData, ...)
+end
+
+local HighTierPets = {
+    -- OG Legendary / High Value
+    "Shadow Dragon", "Bat Dragon", "Frost Dragon", "Giraffe", "Owl", "Parrot", "Crow",
+    "Evil Unicorn", "Arctic Reindeer", "Hedgehog", "Dalmatian", "Turtle", "Kangaroo",
+    "Lion", "Elephant", "Blazing Lion", "African Wild Dog", "Flamingo", "Diamond Butterfly",
+    "Mini Pig", "Caterpillar", "Albino Monkey", "Candyfloss Chick", "Pelican", "Blue Dog",
+    "Pink Cat", "Haetae", "Peppermint Penguin", "Winged Tiger", "Sugar Glider",
+    "Shark Puppy", "Goat", "Sheeeeep", "Lion Cub", "Nessie", "Frostbite Bear",
+    "Balloon Unicorn", "Honey Badger", "Hot Doggo", "Crocodile", "Hare", "Ram", "Yeti",
+    "Meerkat", "Jellyfish", "Happy Clown", "Orchid Butterfly", "Many Mackerel",
+    "Strawberry Shortcake Bat Dragon", "Zombie Buffalo", "Fairy Bat Dragon",
+    "Chocolate Chip Bat Dragon", "Cow", "Dragonfruit Fox", "Monkey King", "Cryptid",
+    "Undead Jousting Horse", "Mermicorn", "Frost Unicorn", "Irish Water Spaniel",
+    "Jekyll Hydra", "Papa Moose", "Strawberry Penguin", "Bush Elephant", "Cupid Dragon",
+    "Black-Chested Pheasant", "Alpaca", "Field Mouse", "Pineapple Owl", "Owlbear",
+    "Tio De Nadal", "Pig", "Royal Mistletroll", "Pirate Ghost Capuchin Monkey",
+    "Moose Calf", "Vampire Dragon", "Shrew", "Mechapup", "Bald Eagle",
+    "Ring-Tailed Lemur", "Tortuga De La Isla", "Werewolf", "Puffin", "Fallow Deer",
+    "Caelum Cervi", "Diamond Amazon", "Sea Slug", "Sugar Axolotl", "Purple Butterfly",
+    "Grim Dragon", "Brown Bear", "Polar Bear", "Sakura Spirit", "Platypus", "Groundhog",
+    "Lava Dragon", "Glacier Moth", "Emperor Gorilla", "2D Kitty", "Hyena",
+    "Arctic Dusk Dragon", "Alley Cat", "Siamese Cat", "Phantom Dragon",
+    "Christmas Pudding Pup", "Glacier Kitsune", "Giant Gold Scarab", "Diamond Albatross",
+    -- 2025 Pets
+    "Dire Wolf", "Giant Panda", "King Penguin", "Golden King Penguin", "Diamond King Penguin",
+    "Clementine Owl", "Apple Owl", "Peach Owl", "Fire Foal", "Fire Stallion", "Fire Mare",
+    "Kitty Bat", "Aztec Dragon", "Ice Dragon", "Snowstorm Dragon", "Gingerbread Bear",
+    "Lunar Dancing Lion", "Rice Cake Bunny", "Hanbok Cat", "Jade Moth",
+    "Spring Butterfly", "Ninja Rabbit", "Sakura Dragon", "Cherry Blossom Fox",
+    "Summer Shark", "Surfboard Seal", "Tropical Parrot", "Firework Fox",
+    "Jungle Cat", "Rainforest Dragon", "Golden Scarab", "Blue Scarab",
+    "Kaiju", "Mecha Dragon", "Robot Cat", "Cyberpunk Fox",
+    "Spooky Spider", "Vampire Bat", "Ghost Wolf", "Zombie Dragon",
+    "Nutcracker Bear", "Snow Globe Dragon", "Candy Cane Reindeer", "Festive Fox",
+    -- 2026 Pets
+    "Cocodile", "Gumball Caterpillar", "Cupid Horse", "Valentine Dragon",
+    "Heart Fox", "Rose Bear", "Candy Dragon", "Sugar Owl",
+}
+
+
+local C = {
+    WinBG     = Color3.fromRGB(255, 255, 255),     
+    Sidebar   = Color3.fromRGB(250, 250, 250),     
+    TopBar    = Color3.fromRGB(245, 245, 245),     
+    Card      = Color3.fromRGB(255, 255, 255),     
+    CardHover = Color3.fromRGB(248, 248, 248),     
+    Stroke    = Color3.fromRGB(220, 220, 220),     
+    StrokeHi  = Color3.fromRGB(0, 0, 0),           
+    TextMain  = Color3.fromRGB(20, 20, 20),        
+    TextSub   = Color3.fromRGB(80, 80, 80),        
+    TextMuted = Color3.fromRGB(140, 140, 140),     
+    Accent    = Color3.fromRGB(0, 0, 0),           
+    ToggleOff = Color3.fromRGB(200, 200, 200),     
+    ToggleOn  = Color3.fromRGB(0, 0, 0),           
+    TrafficR  = Color3.fromRGB(255, 80, 80),       
+    TrafficY  = Color3.fromRGB(255, 180, 60),      
+    TrafficG  = Color3.fromRGB(60, 200, 80),       
+    Divider   = Color3.fromRGB(220, 220, 220),     
+    ScrollBar = Color3.fromRGB(160, 160, 160),     
+    InputBG   = Color3.fromRGB(248, 248, 248),     
+    AccentBtn = Color3.fromRGB(30, 30, 30),        
+}
+
+local SpawnedPets = {}
+local PetModelCache = {}
+local EquippedPet = nil
+local CurrentRideId = nil
+local RideAnimationTrack = nil
+local PetAilmentsCache = {}
+local SpawnedItems = {}
+local currentDialogMessage = "An Adopt Me admin gave you: "  
+
+
+local function WaitForInventory()
+    local maxAttempts = 50
+    local attempts = 0
+    local inventory = nil
+    
+    while attempts < maxAttempts do
+        inventory = ClientData.get("inventory")
+        if inventory then
+            break
+        end
+        task.wait(0.1)
+        attempts = attempts + 1
+    end
+    
+    return inventory
+end
+
+local function GenerateUniquePetName()
+    local prefixes = {"★", "☆", "♡", "☁️", "✨", "🍓", "🌸", "🍯", "☕", "🌙", "🌈", "❄️", "🫧", "🍬", "🍪", "🥛"}
+    local names = {"Shadow", "Blaze", "Frost", "Thunder", "Moon", "Star", "Sky", "Ocean", "River", "Storm", 
+                   "Ember", "Ash", "Dusk", "Dawn", "Night", "Day", "Sun", "Wind", "Rain", "Snow", "Ice", "Fire",
+                   "Nova", "Cosmo", "Galaxy", "Orbit", "Comet", "Meteor", "Aurora", "Nebula", "Crystal", "Gem",
+                   "Ruby", "Sapphire", "Emerald", "Diamond", "Gold", "Silver", "Mystic", "Magic", "Enchant"}
+    
+    local usePrefix = math.random(1, 3) == 1
+    local name = names[math.random(1, #names)]
+    
+    if usePrefix then
+        return prefixes[math.random(1, #prefixes)] .. name
+    else
+        return name .. " " .. prefixes[math.random(1, #prefixes)]
+    end
+end
+
+local NewnessGroups = {
+    mega_neon_flyable_rideable = 990000,
+    mega_neon_flyable = 980000,
+    mega_neon_rideable = 970000,
+    mega_neon = 960000,
+    neon_flyable_rideable = 950000,
+    neon_flyable = 940000,
+    neon_rideable = 930000,
+    neon = 920000,
+    flyable_rideable = 910000,
+    flyable = 900000,
+    rideable = 890000,
+    regular = 880000
+}
+
+local function GetPropertyGroup(properties)
+    local isMega = properties.mega_neon or false
+    local isNeon = properties.neon or false
+    local canFly = properties.flyable or false
+    local canRide = properties.rideable or false
+
+    if isMega then
+        if canFly and canRide then return "mega_neon_flyable_rideable"
+        elseif canFly then return "mega_neon_flyable"
+        elseif canRide then return "mega_neon_rideable"
+        else return "mega_neon" end
+    elseif isNeon then
+        if canFly and canRide then return "neon_flyable_rideable"
+        elseif canFly then return "neon_flyable"
+        elseif canRide then return "neon_rideable"
+        else return "neon" end
+    else
+        if canFly and canRide then return "flyable_rideable"
+        elseif canFly then return "flyable"
+        elseif canRide then return "rideable"
+        else return "regular" end
+    end
+end
+
+local function UpdateClientData(dataPath, modifier)
+    local identity = get_thread_identity and get_thread_identity() or 8
+    set_thread_identity(2)
+    local currentData = ClientData.get(dataPath)
+    local clonedData = currentData and table.clone(currentData) or {}
+    local result = modifier(clonedData)
+    ClientData.predict(dataPath, result)
+    set_thread_identity(identity)
+    return result
+end
+
+local function GenerateUniqueID()
+    return HttpService:GenerateGUID(false)
+end
+
+local function FindInTable(array, checker)
+    if not array then return nil end
+    for index, value in pairs(array) do
+        if checker(value, index) then
+            return index
+        end
+    end
+    return nil
+end
+
+local originalGetServer = ClientData.get_server
+
+function ClientData.get_server(player, key, ...)
+    local data = originalGetServer(player, key, ...)
+
+    if key == "ailments_manager" and player == LocalPlayer then
+        local ailmentsData = {}
+        if data then
+            for k, v in pairs(data) do
+                ailmentsData[k] = type(v) == "table" and table.clone(v) or v
+            end
+        end
+        
+        ailmentsData.ailments = ailmentsData.ailments or {}
+        
+        for petId, _ in pairs(SpawnedPets) do
+            if PetAilmentsCache[petId] then
+                ailmentsData.ailments[petId] = PetAilmentsCache[petId]
+            else
+                local ailmentTypes = {}
+                for kind, _ in pairs(AilmentsDB) do
+                    if kind ~= "at_work" and kind ~= "mystery" and kind ~= "walking" then
+                        table.insert(ailmentTypes, kind)
+                    end
+                end
+
+                local ailmentCount = math.random(2, 4)
+                local petAilments = {}
+                local usedTypes = {}
+
+                for i = 1, math.min(ailmentCount, #ailmentTypes) do
+                    local ailmentKind
+                    repeat
+                        ailmentKind = ailmentTypes[math.random(1, #ailmentTypes)]
+                    until not usedTypes[ailmentKind]
+                    usedTypes[ailmentKind] = true
+
+                    local ailmentId = GenerateUniqueID()
+                    petAilments[ailmentId] = {
+                        components = {},
+                        created_timestamp = os.time(),
+                        kind = ailmentKind,
+                        progress = 0,
+                        rate = 0,
+                        rate_timestamp = os.time(),
+                        sort_order = i * 100
+                    }
+                end
+
+                PetAilmentsCache[petId] = petAilments
+                ailmentsData.ailments[petId] = petAilments
+            end
+        end
+
+        return ailmentsData
+    end
+
+    return data
+end
+
+local function FetchPetModel(petKind)
+    if PetModelCache[petKind] then
+        return PetModelCache[petKind]
+    end
+    local model = DownloadClient.promise_download_copy("Pets", petKind):expect()
+    PetModelCache[petKind] = model
+    return model
+end
+
+-- ── Pet Wear ──────────────────────────────────
+local selectedWearIds = {}  -- table of wearId -> wearName, supports multiple
+local PetAccessoryHelper = nil
+pcall(function()
+    PetAccessoryHelper = require(game:GetService("ReplicatedStorage").SharedModules.Game.PetAccessoryEquipHelper)
+end)
+
+-- Maps accessory_type / equip_type to attachment name on the pet model
+local wearTypeToAttachment = {
+    hats     = "head_crown_attachment",
+    hat      = "head_crown_attachment",
+    collar   = "neck_collar_attachment",
+    back     = "back_backpack_attachment",
+    backpack = "back_backpack_attachment",
+    wings    = "WingsAttachment",
+    glasses  = "face_eyes_attachment",
+    chest    = "chest_badge_attachment",
+    badge    = "chest_badge_attachment",
+    shoes    = "shoe_attachment",
+    shoe     = "shoe_attachment",
+    neck     = "neck_front_attachment",
+    earrings = "earring_left_attachment",
+    earring  = "earring_left_attachment",
+}
+
+-- ── Pet Wear ───────────────────────────────────
+-- Clones wear model from any nearby pet in workspace
+-- then attaches using attach_part_by_attachment
+
+local WearModelCache = {}
+
+local function ScanWorkspaceForWear(modelHandle)
+    -- Already cached?
+    if WearModelCache[modelHandle] then return WearModelCache[modelHandle] end
+    -- Search all pets in workspace for this wear model
+    local petsFolder = workspace:FindFirstChild("Pets")
+    if not petsFolder then return nil end
+    for _, pet in ipairs(petsFolder:GetChildren()) do
+        local pm = pet:FindFirstChild("PetModel")
+        if pm then
+            for _, child in ipairs(pm:GetChildren()) do
+                if child.Name == modelHandle then
+                    local ok, clone = pcall(function() return child:Clone() end)
+                    if ok and clone then
+                        WearModelCache[modelHandle] = clone
+                        return clone
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function ApplyPetWear(petUniqueId, wearId)
+    if not wearId or not PetAvatarItemDB then return end
+    local wearData = PetAvatarItemDB.items_by_kind and PetAvatarItemDB.items_by_kind[wearId]
+    if not wearData then
+        ShowNotif("Pet Wear", "Unknown wear ID: " .. tostring(wearId), "warn")
+        return
+    end
+
+    local pet = SpawnedPets[petUniqueId]
+    if not pet or not pet.model then
+        ShowNotif("Pet Wear", "Pet model not found!", "warn")
+        return
+    end
+
+    -- The spawned pet model IS the top-level model; PetModel is a child of it
+    local petTopModel = pet.model
+    local pm = petTopModel:FindFirstChild("PetModel") or petTopModel
+
+    task.spawn(function()
+        local accessoryAsset = nil
+
+        -- Strategy 1: Direct child in ReplicatedStorage Downloadable folder
+        local ok1, direct = pcall(function()
+            local folder = RS:FindFirstChild("Downloadable") and RS.Downloadable:FindFirstChild("PetAvatarResources")
+            return folder and folder:FindFirstChild(wearData.model_handle)
+        end)
+        if ok1 and direct then
+            accessoryAsset = direct:Clone()
+        end
+
+        -- Strategy 2: DownloadClient (same API the game uses)
+        if not accessoryAsset then
+            local ok2, downloaded = pcall(function()
+                return DownloadClient.promise_download_copy("PetAvatarResources", wearData.model_handle):expect()
+            end)
+            if ok2 and downloaded then
+                accessoryAsset = downloaded:Clone()
+            end
+        end
+
+        -- Strategy 3: Scan workspace pets that already wear this accessory
+        if not accessoryAsset then
+            local wearModel = ScanWorkspaceForWear(wearData.model_handle)
+            if wearModel then
+                accessoryAsset = wearModel:Clone()
+            end
+        end
+
+        if not accessoryAsset then
+            ShowNotif("Pet Wear", "Could not load: " .. (wearData.name or wearId), "warn")
+            return
+        end
+
+        -- Ensure accessory asset is parented so it can be worked on
+        accessoryAsset.Parent = pm
+
+        -- Strategy A: use game's PetAccessoryHelper if available
+        if PetAccessoryHelper and PetAccessoryHelper.equip_accessory then
+            local equipOk, equipErr = pcall(function()
+                PetAccessoryHelper.equip_accessory({
+                    pet_model            = pm,
+                    accessory_base_asset = accessoryAsset,
+                    accessory_item_entry = wearData,
+                    play_poof_effect     = false,
+                    is_mannequin         = false,
+                })
+            end)
+            if equipOk then
+                ShowNotif("Pet Wear", (wearData.name or wearId) .. " equipped!", "success")
+                return
+            end
+            warn("[PetWear] equip_accessory failed: " .. tostring(equipErr))
+        end
+
+        -- Strategy B: manual weld to the correct named attachment
+        local attachName = wearTypeToAttachment[wearData.accessory_type or wearData.equip_type]
+        local targetAttach = nil
+        if attachName then
+            for _, v in ipairs(pm:GetDescendants()) do
+                if v:IsA("Attachment") and v.Name == attachName then
+                    targetAttach = v
+                    break
+                end
+            end
+        end
+        -- If no named attachment found, fall back to the first Attachment in the model
+        if not targetAttach then
+            for _, v in ipairs(pm:GetDescendants()) do
+                if v:IsA("Attachment") then
+                    targetAttach = v
+                    break
+                end
+            end
+        end
+
+        if not targetAttach then
+            ShowNotif("Pet Wear", "No attachment point on pet for: " .. (wearData.name or wearId), "warn")
+            return
+        end
+
+        -- Find the primary part of the accessory asset
+        local accessoryPart = nil
+        if accessoryAsset:IsA("BasePart") then
+            accessoryPart = accessoryAsset
+        else
+            accessoryPart = accessoryAsset.PrimaryPart
+                or accessoryAsset:FindFirstChildOfClass("BasePart")
+        end
+
+        if not accessoryPart then
+            ShowNotif("Pet Wear", "Accessory has no BasePart: " .. (wearData.name or wearId), "warn")
+            return
+        end
+
+        -- Unanchor all parts in the accessory
+        for _, p in ipairs(accessoryAsset:GetDescendants()) do
+            if p:IsA("BasePart") then
+                p.Anchored = false
+                p.CanCollide = false
+            end
+        end
+
+        -- Weld the accessory part to the target attachment's parent part
+        local weld = Instance.new("WeldConstraint")
+        weld.Part0 = accessoryPart
+        weld.Part1 = targetAttach.Parent
+        weld.Parent = accessoryPart
+
+        -- Position the accessory at the attachment world position
+        accessoryPart.CFrame = targetAttach.WorldCFrame
+
+        ShowNotif("Pet Wear", (wearData.name or wearId) .. " equipped! (manual weld)", "success")
+    end)
+end
+
+local function InjectAllWearToInventory() end -- kept for compat
+
+local function ApplyNeonVisuals(petModel, petData)
+    local modelInstance = petModel:FindFirstChild("PetModel")
+    if modelInstance and (petData.properties.neon or petData.properties.mega_neon) then
+        local petKindData = KindDB[petData.id]
+        if petKindData and petKindData.neon_parts then
+            for partName, partProps in pairs(petKindData.neon_parts) do
+                local geoPart = PetRigs.get(modelInstance).get_geo_part(modelInstance, partName)
+                if geoPart then
+                    geoPart.Material = partProps.Material
+                    geoPart.Color = partProps.Color
+                end
+            end
+        end
+    end
+end
+
+local function RegisterPetWrapper(wrapperData)
+    UpdateClientData("pet_char_wrappers", function(wrappers)
+        wrappers = wrappers or {}
+        wrapperData.unique = #wrappers + 1
+        wrapperData.index = #wrappers + 1
+        wrappers[#wrappers + 1] = wrapperData
+        return wrappers
+    end)
+end
+
+local function RegisterPetState(stateManager)
+    UpdateClientData("pet_state_managers", function(managers)
+        managers = managers or {}
+        managers[#managers + 1] = stateManager
+        return managers
+    end)
+end
+
+local function RemovePetWrapper(petUniqueId)
+    UpdateClientData("pet_char_wrappers", function(wrappers)
+        if not wrappers then return {} end
+        local wrapperIndex = FindInTable(wrappers, function(w)
+            return w and w.pet_unique == petUniqueId
+        end)
+        if wrapperIndex then
+            table.remove(wrappers, wrapperIndex)
+            for i = wrapperIndex, #wrappers do
+                if wrappers[i] then
+                    wrappers[i].unique = i
+                    wrappers[i].index = i
+                end
+            end
+        end
+        return wrappers
+    end)
+
+end
+
+local function RemovePetState(petUniqueId)
+    local pet = SpawnedPets[petUniqueId]
+    if not pet or not pet.model then return end
+
+    UpdateClientData("pet_state_managers", function(managers)
+        if not managers then return {} end
+        local managerIndex = FindInTable(managers, function(m)
+            return m and m.char == pet.model
+        end)
+        if managerIndex then
+            table.remove(managers, managerIndex)
+        end
+        return managers
+    end)
+end
+
+local function ClearPetStates(petUniqueId)
+    local pet = SpawnedPets[petUniqueId]
+    if not pet or not pet.model then return end
+
+    UpdateClientData("pet_state_managers", function(managers)
+        if not managers then return {} end
+        local managerIndex = FindInTable(managers, function(m)
+            return m and m.char == pet.model
+        end)
+        if managerIndex then
+            local updated = table.clone(managers)
+            updated[managerIndex] = table.clone(updated[managerIndex])
+            updated[managerIndex].states = {}
+            return updated
+        end
+        return managers
+    end)
+end
+
+local function SetPetState(petUniqueId, stateId)
+    local pet = SpawnedPets[petUniqueId]
+    if not pet or not pet.model then return end
+
+    UpdateClientData("pet_state_managers", function(managers)
+        if not managers then return {} end
+        local managerIndex = FindInTable(managers, function(m)
+            return m and m.char == pet.model
+        end)
+        if managerIndex then
+            local updated = table.clone(managers)
+            updated[managerIndex] = table.clone(updated[managerIndex])
+            updated[managerIndex].states = {{ id = stateId }}
+            return updated
+        end
+        return managers
+    end)
+end
+
+local function ClearPlayerStates()
+    UpdateClientData("state_manager", function(stateManager)
+        stateManager = stateManager or {}
+        local updated = table.clone(stateManager)
+        updated.states = {}
+        updated.is_sitting = false
+        return updated
+    end)
+end
+
+local function SetPlayerState(stateId)
+    UpdateClientData("state_manager", function(stateManager)
+        stateManager = stateManager or {}
+        local updated = table.clone(stateManager)
+        updated.states = {{ id = stateId }}
+        updated.is_sitting = true
+        return updated
+    end)
+end
+
+local function AttachRideConstraint(petModel)
+    local character = LocalPlayer.Character
+    if not character or not character.PrimaryPart then return false end
+
+    local ridePos = petModel:FindFirstChild("RidePosition", true)
+    if not ridePos then return false end
+
+    local sourceAttach = Instance.new("Attachment")
+    sourceAttach.Parent = ridePos
+    sourceAttach.Position = Vector3.new(0, 1.237, 0)
+    sourceAttach.Name = "SourceAttachment"
+
+    local rigidConstraint = Instance.new("RigidConstraint")
+    rigidConstraint.Name = "StateConnection"
+    rigidConstraint.Attachment0 = sourceAttach
+    rigidConstraint.Attachment1 = character.PrimaryPart.RootAttachment
+    rigidConstraint.Parent = character
+
+    return true
+end
+
+local function DismountPet()
+    if not CurrentRideId then return end
+
+    local pet = SpawnedPets[CurrentRideId]
+    if pet and pet.model then
+        if RideAnimationTrack then
+            RideAnimationTrack:Stop()
+            RideAnimationTrack:Destroy()
+            RideAnimationTrack = nil
+        end
+
+        local sourceAttach = pet.model:FindFirstChild("SourceAttachment", true)
+        if sourceAttach then sourceAttach:Destroy() end
+
+        local character = LocalPlayer.Character
+        if character then
+            for _, part in pairs(character:GetDescendants()) do
+                if part:IsA("BasePart") and part:GetAttribute("HaveMass") then
+                    part.Massless = false
+                end
+            end
+        end
+
+        ClearPetStates(CurrentRideId)
+        ClearPlayerStates()
+        pet.model:ScaleTo(1)
+    end
+    CurrentRideId = nil
+end
+
+local function MountPet(petUniqueId, playerState, petState)
+    local pet = SpawnedPets[petUniqueId]
+    if not pet or not pet.model then return end
+
+    local character = LocalPlayer.Character
+    if not character or not character.PrimaryPart or not character:FindFirstChild("Humanoid") then return end
+
+    DismountPet()
+    CurrentRideId = petUniqueId
+
+    SetPetState(petUniqueId, petState)
+    SetPlayerState(playerState)
+    pet.model:ScaleTo(2)
+    AttachRideConstraint(pet.model)
+
+    RideAnimationTrack = character.Humanoid.Animator:LoadAnimation(AnimationManager.get_track("PlayerRidingPet"))
+    character.Humanoid.Sit = true
+
+    for _, part in pairs(character:GetDescendants()) do
+        if part:IsA("BasePart") and part.Massless == false then
+            part.Massless = true
+            part:SetAttribute("HaveMass", true)
+        end
+    end
+
+    RideAnimationTrack:Play()
+end
+
+local function RidePet(petUniqueId)
+    MountPet(petUniqueId, "PlayerRidingPet", "PetBeingRidden")
+end
+
+local function FlyPet(petUniqueId)
+    MountPet(petUniqueId, "PlayerFlyingPet", "PetBeingFlown")
+end
+
+local function UnequipPet(petData)
+    local pet = SpawnedPets[petData.unique]
+    if not pet or not pet.model then return end
+
+    if CurrentRideId == petData.unique then
+        DismountPet()
+    end
+
+    RemovePetWrapper(petData.unique)
+    RemovePetState(petData.unique)
+    -- Remove from PetEntityManager and CharWrapperClient patch
+    if PetEntityManager then
+        pcall(function() PetEntityManager.remove_pet_entity_by_char(pet.model) end)
+    end
+    if CharWrapperClient._spawned_wrappers then
+        CharWrapperClient._spawned_wrappers[pet.model] = nil
+    end
+    -- Remove name tag
+    pcall(function()
+        UIManager.apps.PlayerNameApp:remove_npc_id(pet.model)
+    end)
+    pet.model:Destroy()
+    pet.model = nil
+
+    if EquippedPet and EquippedPet.unique == petData.unique then
+        EquippedPet = nil
+    end
+
+    PetAilmentsCache[petData.unique] = nil
+
+    -- Remove from equip_manager so BackpackApp shows Equip again
+    pcall(function()
+        local identity = get_thread_identity and get_thread_identity() or 8
+        set_thread_identity(2)
+        local equipManager = ClientData.get("equip_manager") or {}
+        local prev = table.clone(equipManager)
+        local updated = table.clone(equipManager)
+        updated.pets = updated.pets or {}
+        local newPets = {}
+        for _, v in ipairs(updated.pets) do
+            if v.unique ~= petData.unique then
+                table.insert(newPets, v)
+            end
+        end
+        updated.pets = newPets
+        ClientData.predict("equip_manager", updated)
+        pcall(function()
+            ClientData._trigger_server_on_change("equip_manager", updated, prev)
+        end)
+        set_thread_identity(identity)
+    end)
+
+    task.wait(0.15)
+    pcall(function()
+        AilmentsClient.on_ailments_changed(LocalPlayer)
+    end)
+    task.defer(function()
+        if UIManager and UIManager.apps then
+            pcall(function()
+                if UIManager.apps.BackpackApp then
+                    UIManager.apps.BackpackApp:refresh_rendered_items()
+                end
+            end)
+        end
+    end)
+end
+
+local function EquipPet(petData)
+    if petData.category ~= "pets" then return end
+
+    if EquippedPet then
+        UnequipPet(EquippedPet)
+    end
+
+    pcall(function()
+        for _, wrapper in pairs(ClientData.get("pet_char_wrappers") or {}) do
+            if wrapper and wrapper.controller == LocalPlayer then
+                RouterClient.get("ToolAPI/Unequip"):InvokeServer(wrapper.pet_unique)
+            end
+        end
+    end)
+
+    if not SpawnedPets[petData.unique] then
+        SpawnedPets[petData.unique] = { data = petData, model = nil }
+    end
+
+    local petModel = FetchPetModel(petData.kind):Clone()
+    petModel.Parent = workspace
+    SpawnedPets[petData.unique].model = petModel
+    ApplyNeonVisuals(petModel, petData)
+
+    EquippedPet = petData
+
+    -- Add name tag via PlayerNameApp (same as NPCProxyPetEntity)
+    task.defer(function()
+        pcall(function()
+            local kindData = KindDB[petData.id]
+            if kindData then
+                -- Use rp_name if set, otherwise use kind name
+                local rpName = petData.properties.rp_name
+                local displayName = (rpName and rpName ~= "") and ("(%s)"):format(rpName) or kindData.name
+                UIManager.apps.PlayerNameApp:add_npc_id(petModel, displayName, {
+                    pet_kind = petData.kind,
+                })
+            end
+        end)
+    end)
+
+    -- Register with PetEntityManager so overhead UI renders (name, friendship bar, ailments)
+    task.spawn(function()
+        task.wait(0.5) -- wait for wrapper to be registered via ClientData
+        if PetEntityManager then
+            pcall(function()
+                local kindData = KindDB[petData.id]
+                if kindData and not PetEntityManager.get_pet_entity(petModel) then
+                    -- Build wrapper object that CharWrapperClient.get() will return
+                    local wrapperObj = {
+                        char = petModel,
+                        pet_model = petModel:FindFirstChild("PetModel") or petModel,
+                        mega_neon = petData.properties.mega_neon or false,
+                        neon = petData.properties.neon or false,
+                        flyable = petData.properties.flyable or false,
+                        rideable = petData.properties.rideable or false,
+                        player = LocalPlayer,
+                        entity_controller = LocalPlayer,
+                        client_has_control = true,
+                        rp_name = petData.properties.rp_name or "",
+                        pet_trick_level = petData.properties.pet_trick_level or 0,
+                        pet_unique = petData.unique,
+                        pet_id = petData.id,
+                        is_pet = true,
+                        location = {
+                            full_destination_id = "housing",
+                            destination_id = "housing",
+                            house_owner = LocalPlayer
+                        },
+                        pet_progression = {
+                            age = petData.properties.age or 6,
+                            percentage = 0,
+                            friendship_level = petData.properties.friendship_level or 0
+                        },
+                    }
+                    -- Patch CharWrapperClient.get to return our wrapper for this model
+                    -- Only patch once, then build a lookup table
+                    if not CharWrapperClient._spawned_wrappers then
+                        CharWrapperClient._spawned_wrappers = {}
+                        local originalGet = CharWrapperClient.get
+                        CharWrapperClient.get = function(char)
+                            if CharWrapperClient._spawned_wrappers[char] then
+                                return CharWrapperClient._spawned_wrappers[char]
+                            end
+                            return originalGet(char)
+                        end
+                    end
+                    CharWrapperClient._spawned_wrappers[petModel] = wrapperObj
+
+                    local function entityCallback(entity)
+                        entity.base.char = petModel
+                        entity.base.char_wrapper = wrapperObj
+                        entity.base.pet_model = wrapperObj.pet_model
+                        entity.base.humanoid = petModel:FindFirstChildOfClass("Humanoid")
+                        entity.base.root = petModel:FindFirstChild("HumanoidRootPart")
+                        -- Force entity_controller INSIDE the callback before the entity is finalized
+                        wrapperObj.entity_controller = LocalPlayer
+                        wrapperObj.player = LocalPlayer
+                        wrapperObj.client_has_control = true
+                    end
+                    local entity = PetEntityManager.create_pet_entity(petModel, kindData, entityCallback)
+                    -- Also force after creation in case something overwrote it
+                    if entity then
+                        if entity.base.char_wrapper then
+                            entity.base.char_wrapper.entity_controller = LocalPlayer
+                            entity.base.char_wrapper.client_has_control = true
+                        end
+                        -- Manually add to local owned list if not already there
+                        local owned = PetEntityManager.get_local_owned_pet_entities()
+                        if not table.find(owned, entity) then
+                            table.insert(owned, entity)
+                            PetEntityManager.get_local_owned_pet_entity_updated_signal():Fire(owned, entity)
+                        end
+                    end
+                end
+            end)
+        end
+    end)
+
+    -- Inject into equip_manager so BackpackApp sees the pet as equipped
+    pcall(function()
+        local identity = get_thread_identity and get_thread_identity() or 8
+        set_thread_identity(2)
+        local equipManager = ClientData.get("equip_manager") or {}
+        local prev = table.clone(equipManager)
+        local updated = table.clone(equipManager)
+        updated.pets = updated.pets or {}
+        local newPets = {}
+        for _, v in ipairs(updated.pets) do
+            if v.unique ~= petData.unique then
+                table.insert(newPets, v)
+            end
+        end
+        table.insert(newPets, petData)
+        updated.pets = newPets
+        ClientData.predict("equip_manager", updated)
+        -- Trigger the server_on_change_hook so BackpackApp re-renders
+        pcall(function()
+            ClientData._trigger_server_on_change("equip_manager", updated, prev)
+        end)
+        set_thread_identity(identity)
+    end)
+
+    -- Refresh backpack UI so Equip button updates to Unequip
+    task.defer(function()
+        if UIManager and UIManager.apps then
+            pcall(function()
+                if UIManager.apps.BackpackApp then
+                    UIManager.apps.BackpackApp:refresh_rendered_items()
+                end
+            end)
+        end
+    end)
+
+    -- Apply wear after model is fully registered (wait for wrappers + ailments)
+    task.spawn(function()
+        task.wait(0.6) -- wait for model to be parented and registered
+        for wearId, _ in pairs(selectedWearIds) do
+            local wid = wearId
+            task.spawn(function()
+                ApplyPetWear(petData.unique, wid)
+            end)
+            task.wait(0.15)
+        end
+    end)
+
+    task.defer(function()
+        RegisterPetWrapper({
+            char = petModel,
+            mega_neon = petData.properties.mega_neon or false,
+            neon = petData.properties.neon or false,
+            flyable = petData.properties.flyable or false,
+            rideable = petData.properties.rideable or false,
+            player = LocalPlayer,
+            entity_controller = LocalPlayer,
+            controller = LocalPlayer,
+            client_has_control = true,
+            rp_name = petData.properties.rp_name or "",
+            pet_trick_level = petData.properties.pet_trick_level or 0,
+            pet_unique = petData.unique,
+            pet_id = petData.id,
+            infectible = true,
+            transform_mode = 1,
+            location = {
+                full_destination_id = "housing",
+                destination_id = "housing",
+                house_owner = LocalPlayer
+            },
+            pet_progression = {
+                age = petData.properties.age or math.random(1, 6),
+                percentage = math.random(0, 99) / 100,
+                friendship_level = petData.properties.friendship_level or 0
+            },
+            are_colors_sealed = false,
+            is_pet = true,
+        })
+
+        RegisterPetState({
+            char = petModel,
+            player = LocalPlayer,
+            store_key = "pet_state_managers",
+            is_sitting = false,
+            chars_connected_to_me = {},
+            states = {}
+        })
+        task.wait(0.15)
+        pcall(function()
+            AilmentsClient.on_ailments_changed(LocalPlayer)
+        end)
+    end)
+end
+
+local NextToyOrder = 60000
+
+
+local function showPetDialog(petName, petId, properties)
+    if not DialogApp or not DialogApp.dialog then
+        if HintApp then 
+            HintApp:hint({ text = '⚡ Spawned ' .. petName .. ' ⚡', length = 3, overridable = true }) 
+        end
+        return
+    end
+    
+    local itemKindData = KindDB[petId]
+    if not itemKindData then return end
+    
+    task.spawn(function()
+        pcall(function()
+            DialogApp:dialog({
+                dialog_type = "ConfirmDialog",
+                text = currentDialogMessage .. petName,
+                item = { 
+                    id = petId, 
+                    name = petName, 
+                    category = "pets", 
+                    kind = itemKindData.kind, 
+                    properties = properties 
+                },
+                button = "Claim",
+                yields = true
+            })
+        end)
+    end)
+end
+
+
+local function CreateInventoryItem(itemId, category, properties)
+    local uniqueId = GenerateUniqueID()
+    local itemKindData = KindDB[itemId]
+
+    if not itemKindData then
+        warn("Item not found: " .. itemId)
+        return nil
+    end
+
+    properties = properties or {}
+    local newnessValue = NextToyOrder
+
+    if category == "pets" then
+        local groupKey = GetPropertyGroup(properties)
+        NewnessGroups[groupKey] = NewnessGroups[groupKey] - 1
+        newnessValue = NewnessGroups[groupKey]
+
+        
+        local safeProperties = {
+            flyable = properties.flyable or false,
+            rideable = properties.rideable or false,
+            age = properties.age or math.random(1, 6),
+            friendship_level = properties.friendship_level or 0,
+            pet_trick_level = properties.pet_trick_level or 0,
+            rp_name = properties.rp_name or GenerateUniquePetName()
+        }
+        
+        if properties.neon then
+            safeProperties.neon = true
+        end
+        if properties.mega_neon then
+            safeProperties.mega_neon = true
+        end
+        -- If wear is selected, set wearing = true so the game's own pip system shows it
+        if next(selectedWearIds) ~= nil then
+            safeProperties.wearing = true
+        end
+        
+        properties = safeProperties
+    else
+        NextToyOrder = NextToyOrder - 1
+        newnessValue = NextToyOrder
+    end
+
+    local itemData = {
+        unique = uniqueId,
+        category = category,
+        id = itemId,
+        kind = itemKindData.kind,
+        newness_order = newnessValue,
+        properties = properties,
+        _source = "blueprint.lua"
+    }
+
+    local identity = get_thread_identity and get_thread_identity() or 8
+    set_thread_identity(2)
+    
+    local inventory = ClientData.get("inventory")
+    if inventory then
+        if not inventory[category] then
+            inventory[category] = {}
+        end
+        inventory[category][uniqueId] = itemData
+    else
+        warn("Inventory not available yet, attempting to create...")
+        ClientData.predict("inventory", { pets = {}, toys = {}, vehicles = {}, gifts = {}, food = {} })
+        inventory = ClientData.get("inventory")
+        if inventory then
+            if not inventory[category] then
+                inventory[category] = {}
+            end
+            inventory[category][uniqueId] = itemData
+        end
+    end
+    
+    set_thread_identity(identity)
+
+    if category == "pets" then
+        SpawnedPets[uniqueId] = { data = itemData, model = nil }
+    end
+    
+    SpawnedItems[uniqueId] = true
+
+    task.defer(function()
+        if UIManager and UIManager.apps and UIManager.apps.BackpackApp then
+            pcall(function()
+                UIManager.apps.BackpackApp:refresh_rendered_items()
+            end)
+        end
+    end)
+
+    return itemData
+end
+
+local function DeleteAllSpawnedPets()
+    local identity = get_thread_identity and get_thread_identity() or 8
+    set_thread_identity(2)
+    
+    local inventory = ClientData.get("inventory")
+    local removed = 0
+    
+    if inventory and inventory.pets then
+        for uniqueId, _ in pairs(SpawnedItems) do
+            if inventory.pets[uniqueId] and inventory.pets[uniqueId]._source == "blueprint.lua" then
+                inventory.pets[uniqueId] = nil
+                removed = removed + 1
+            end
+        end
+    end
+    
+    set_thread_identity(identity)
+    
+    for uniqueId, _ in pairs(SpawnedPets) do
+        if SpawnedPets[uniqueId] and SpawnedPets[uniqueId].data and SpawnedPets[uniqueId].data._source == "blueprint.lua" then
+            if SpawnedPets[uniqueId].model then
+                pcall(function()
+                    SpawnedPets[uniqueId].model:Destroy()
+                end)
+            end
+            PetAilmentsCache[uniqueId] = nil  -- fix memory leak
+        end
+    end
+    
+    SpawnedPets = {}
+    SpawnedItems = {}
+    PetAilmentsCache = {}
+    EquippedPet = nil
+    CurrentRideId = nil
+    
+    task.defer(function()
+        if UIManager and UIManager.apps and UIManager.apps.BackpackApp then
+            pcall(function()
+                UIManager.apps.BackpackApp:refresh_rendered_items()
+            end)
+        end
+    end)
+    
+    return removed
+end
+
+local function FindPetId(petName)
+    if not InventoryDB or not InventoryDB.pets then return nil end
+    for id, info in pairs(InventoryDB.pets) do
+        if info and info.name and info.name:lower() == petName:lower() then
+            return id
+        end
+    end
+    return nil
+end
+
+local function FindToyId(toyName)
+    if not InventoryDB or not InventoryDB.toys then return nil end
+    for id, info in pairs(InventoryDB.toys) do
+        if info and info.name and info.name:lower() == toyName:lower() then
+            return id
+        end
+    end
+    return nil
+end
+
+local function FindItemId(itemName)
+    local categories = {
+        {name = "pets", finder = FindPetId},
+        {name = "toys", finder = FindToyId}
+    }
+    
+    for _, cat in ipairs(categories) do
+        local id = cat.finder(itemName)
+        if id then return id, cat.name end
+    end
+    return nil, nil
+end
+
+local OriginalRouterGet = RouterClient.get
+
+-- Track spawned toy unique IDs so we can intercept equip calls
+local SpawnedToys = {}
+
+function RouterClient.get(endpoint)
+    if endpoint == "ToolAPI/Equip" then
+        return {
+            InvokeServer = function(_, uniqueId)
+                -- Check if it's a spawned pet
+                local pet = SpawnedPets[uniqueId]
+                if pet then
+                    EquipPet(pet.data)
+                    return true, { action = "equip", is_server = true }
+                end
+                -- Check if it's a spawned toy
+                if SpawnedToys[uniqueId] then
+                    local toyData = SpawnedToys[uniqueId]
+                    task.spawn(function()
+                        local ok, ItemModelHelper = pcall(function()
+                            return require(RS.ClientModules.Game.ItemModelHelper)
+                        end)
+                        if not ok or not ItemModelHelper then
+                            warn("[ToySpawner] Failed to load ItemModelHelper: " .. tostring(ItemModelHelper))
+                            return
+                        end
+
+                        warn("[ToySpawner] Downloading model for id: " .. tostring(toyData.id))
+
+                        local resolveOk, model = pcall(function()
+                            return ItemModelHelper.promise_download_item_model(toyData.id):expect()
+                        end)
+
+                        if not resolveOk or not model then
+                            warn("[ToySpawner] ItemModelHelper download failed: " .. tostring(model))
+                            return
+                        end
+
+                        warn("[ToySpawner] Got model: " .. model.Name .. " ClassName: " .. model.ClassName)
+
+                        local char = LocalPlayer.Character
+                        if not char then return end
+
+                        local rightHand = char:FindFirstChild("RightHand")
+                            or char:FindFirstChild("Right Arm")
+                        if not rightHand then
+                            warn("[ToySpawner] No right hand found")
+                            return
+                        end
+
+                        -- ItemModelHelper already sets up RightMount as PrimaryPart
+                        -- Find it to use as our weld anchor
+                        local mountPart = model:FindFirstChild("RightMount", true)
+                            or model:FindFirstChild("LeftMount", true)
+                            or model:FindFirstChild("RootMount", true)
+
+                        -- Fallback: PrimaryPart, then any BasePart
+                        if not mountPart then
+                            mountPart = model.PrimaryPart
+                        end
+                        if not mountPart then
+                            for _, part in ipairs(model:GetDescendants()) do
+                                if part:IsA("BasePart") then
+                                    mountPart = part
+                                    break
+                                end
+                            end
+                        end
+                        if model:IsA("BasePart") then
+                            mountPart = model
+                        end
+
+                        if not mountPart then
+                            warn("[ToySpawner] No BasePart found in model")
+                            return
+                        end
+
+                        warn("[ToySpawner] Welding to part: " .. mountPart.Name)
+
+                        -- Force unanchor ALL parts — ItemModelHelper anchors them during processing
+                        local partCount = 0
+                        for _, part in ipairs(model:GetDescendants()) do
+                            if part:IsA("BasePart") then
+                                part.Anchored = false
+                                part.CanCollide = false
+                                part.Massless = true
+                                partCount = partCount + 1
+                                warn("[ToySpawner] Part: " .. part.Name .. " T:" .. part.Transparency .. " Anchored was reset")
+                            end
+                        end
+                        if model:IsA("BasePart") then
+                            model.Anchored = false
+                            model.CanCollide = false
+                            model.Massless = true
+                        end
+                        warn("[ToySpawner] Total parts: " .. partCount)
+
+                        -- Parent first so world CFrames are valid
+                        model.Parent = char
+
+                        -- Weld ALL visible parts to RightMount so they follow it
+                        -- (they are not internally connected after ItemModelHelper processing)
+                        for _, part in ipairs(model:GetDescendants()) do
+                            if part:IsA("BasePart") and part ~= mountPart then
+                                local internalWeld = Instance.new("WeldConstraint")
+                                internalWeld.Part0 = mountPart
+                                internalWeld.Part1 = part
+                                internalWeld.Parent = mountPart
+                            end
+                        end
+
+                        -- Per-toy C0 offset corrections (position, rotation)
+                        local toyOffsets = {
+                            ["winter_2022_rainbow_rattle"] = CFrame.new(0, -0.3, 0) * CFrame.Angles(0, 0, math.rad(90)),
+                        }
+
+                        local offsetCF = toyOffsets[toyData.id] or CFrame.new(0, 0, -0.3)
+
+                        -- Now weld RightMount to the hand
+                        local weld = Instance.new("Motor6D")
+                        weld.Name = "ToyWeld"
+                        weld.Part0 = rightHand
+                        weld.Part1 = mountPart
+                        weld.C0 = offsetCF
+                        weld.C1 = CFrame.new(0, 0, 0)
+                        weld.Parent = rightHand
+
+                        SpawnedToys[toyData.unique].weld = weld
+                        SpawnedToys[toyData.unique].model = model
+
+                        -- Inject into equip_manager so backpack shows Unequip
+                        pcall(function()
+                            local identity = get_thread_identity and get_thread_identity() or 8
+                            set_thread_identity(2)
+                            local equipManager = ClientData.get("equip_manager") or {}
+                            local prev = table.clone(equipManager)
+                            local updated = table.clone(equipManager)
+                            updated.toys = updated.toys or {}
+                            local newToys = {}
+                            for _, v in ipairs(updated.toys) do
+                                if v.unique ~= toyData.unique then
+                                    table.insert(newToys, v)
+                                end
+                            end
+                            table.insert(newToys, toyData)
+                            updated.toys = newToys
+                            ClientData.predict("equip_manager", updated)
+                            pcall(function()
+                                ClientData._trigger_server_on_change("equip_manager", updated, prev)
+                            end)
+                            set_thread_identity(identity)
+                        end)
+                        task.defer(function()
+                            pcall(function() UIManager.apps.BackpackApp:refresh_rendered_items() end)
+                        end)
+
+                        warn("[ToySpawner] Done! Model parented to character and welded.")
+                    end)
+                    return true, { action = "equip", is_server = true }
+                end
+                return OriginalRouterGet("ToolAPI/Equip"):InvokeServer(uniqueId)
+            end
+        }
+    elseif endpoint == "ToolAPI/Unequip" then
+        return {
+            InvokeServer = function(_, uniqueId)
+                local pet = SpawnedPets[uniqueId]
+                if pet then
+                    UnequipPet(pet.data)
+                    return true, { action = "unequip", is_server = true }
+                end
+                if SpawnedToys[uniqueId] then
+                    local toyData = SpawnedToys[uniqueId]
+                    if toyData.weld then
+                        pcall(function() toyData.weld:Destroy() end)
+                        toyData.weld = nil
+                    end
+                    if toyData.model then
+                        pcall(function() toyData.model:Destroy() end)
+                        toyData.model = nil
+                    end
+                    -- Remove from equip_manager so backpack shows Equip again
+                    pcall(function()
+                        local identity = get_thread_identity and get_thread_identity() or 8
+                        set_thread_identity(2)
+                        local equipManager = ClientData.get("equip_manager") or {}
+                        local prev = table.clone(equipManager)
+                        local updated = table.clone(equipManager)
+                        updated.toys = updated.toys or {}
+                        local newToys = {}
+                        for _, v in ipairs(updated.toys) do
+                            if v.unique ~= uniqueId then
+                                table.insert(newToys, v)
+                            end
+                        end
+                        updated.toys = newToys
+                        ClientData.predict("equip_manager", updated)
+                        pcall(function()
+                            ClientData._trigger_server_on_change("equip_manager", updated, prev)
+                        end)
+                        set_thread_identity(identity)
+                    end)
+                    task.defer(function()
+                        pcall(function() UIManager.apps.BackpackApp:refresh_rendered_items() end)
+                    end)
+                    return true, { action = "unequip", is_server = true }
+                end
+                return OriginalRouterGet("ToolAPI/Unequip"):InvokeServer(uniqueId)
+            end
+        }
+    elseif endpoint == "AdoptAPI/RidePet" then
+        return {
+            InvokeServer = function(_, petData)
+                local pet = SpawnedPets[petData.pet_unique]
+                if not pet then
+                    return OriginalRouterGet("AdoptAPI/RidePet"):InvokeServer(petData)
+                end
+                RidePet(petData.pet_unique)
+                return true
+            end
+        }
+    elseif endpoint == "AdoptAPI/FlyPet" then
+        return {
+            InvokeServer = function(_, petData)
+                local pet = SpawnedPets[petData.pet_unique]
+                if not pet then
+                    return OriginalRouterGet("AdoptAPI/FlyPet"):InvokeServer(petData)
+                end
+                FlyPet(petData.pet_unique)
+                return true
+            end
+        }
+    elseif endpoint == "AdoptAPI/ExitSeatStates" then
+        return {
+            FireServer = function()
+                if CurrentRideId then
+                    DismountPet()
+                    return true
+                end
+                return OriginalRouterGet("AdoptAPI/ExitSeatStates"):FireServer()
+            end
+        }
+    elseif endpoint == "SettingsAPI/SetPetRoleplayName" then
+        return {
+            InvokeServer = function(_, petUniqueId, newName)
+                local pet = SpawnedPets[petUniqueId]
+                if not pet then
+                    return OriginalRouterGet("SettingsAPI/SetPetRoleplayName"):InvokeServer(petUniqueId, newName)
+                end
+                
+                local identity = get_thread_identity and get_thread_identity() or 8
+                set_thread_identity(2)
+                
+                local inventory = ClientData.get("inventory")
+                if inventory and inventory.pets and inventory.pets[petUniqueId] then
+                    inventory.pets[petUniqueId].properties.rp_name = newName
+                end
+                
+                if pet.data then
+                    pet.data.properties.rp_name = newName
+                end
+                
+                local wrappers = ClientData.get("pet_char_wrappers")
+                if wrappers then
+                    for _, wrapper in pairs(wrappers) do
+                        if wrapper and wrapper.pet_unique == petUniqueId then
+                            wrapper.rp_name = newName
+                            break
+                        end
+                    end
+                end
+                
+                set_thread_identity(identity)
+                return true
+            end
+        }
+    elseif endpoint == "ToolAPI/EquipPetAccessory" or endpoint == "PetAccessoryAPI/Equip" or endpoint == "ToolAPI/EquipAccessory" then
+        return {
+            InvokeServer = function(_, wearUniqueId, petUniqueId)
+                -- Find the pet model
+                local pet = SpawnedPets[petUniqueId]
+                if not pet or not pet.model then return false end
+                if not PetAvatarItemDB then return false end
+
+                -- Get wear data from inventory
+                local identity = getthreadidentity and getthreadidentity() or 8
+                setthreadidentity(2)
+                local inventory = ClientData.get("inventory")
+                setthreadidentity(identity)
+
+                local wearItem = inventory and inventory.pet_accessories and inventory.pet_accessories[wearUniqueId]
+                if not wearItem then return false end
+
+                local wearData = PetAvatarItemDB.items_by_kind and PetAvatarItemDB.items_by_kind[wearItem.id]
+                if not wearData then return false end
+
+                -- Use PetAccessoryEquipHelper to attach
+                if PetAccessoryHelper then
+                    local attachName = wearTypeToAttachment[wearData.accessory_type]
+                    local pm = pet.model:FindFirstChild("PetModel")
+                    if pm and attachName then
+                        local targetAttachment = nil
+                        for _, v in ipairs(pm:GetDescendants()) do
+                            if v:IsA("Attachment") and v.Name == attachName then
+                                targetAttachment = v
+                                break
+                            end
+                        end
+                        if targetAttachment then
+                            -- Search workspace for this wear model on any pet and clone it
+                            local wearClone = nil
+                            local petsFolder = workspace:FindFirstChild("Pets")
+                            if petsFolder then
+                                for _, otherPet in ipairs(petsFolder:GetChildren()) do
+                                    local opm = otherPet:FindFirstChild("PetModel")
+                                    if opm then
+                                        for _, child in ipairs(opm:GetChildren()) do
+                                            if child.Name == wearData.model_handle or child.Name == wearData.name then
+                                                local ok, clone = pcall(function() return child:Clone() end)
+                                                if ok and clone then wearClone = clone break end
+                                            end
+                                        end
+                                    end
+                                    if wearClone then break end
+                                end
+                            end
+                            if wearClone then
+                                wearClone.Parent = pet.model
+                                local wearPart = wearClone:FindFirstChildOfClass("BasePart") or wearClone
+                                if wearPart and wearPart:IsA("BasePart") then
+                                    pcall(PetAccessoryHelper.attach_part_by_attachment, wearPart, targetAttachment)
+                                end
+                                return true
+                            end
+                        end
+                    end
+                end
+                return false
+            end
+        }
+    elseif endpoint == "ToolAPI/CreateSimpleThrowToy" then
+        return {
+            InvokeServer = function(_, params)
+                -- Find the toy in SpawnedToys
+                local toy = SpawnedToys[params.unique_id]
+                if not toy then return nil end
+                -- Download and spawn the toy model in workspace
+                local ok, ItemModelHelper = pcall(function()
+                    return require(RS.ClientModules.Game.ItemModelHelper)
+                end)
+                if not ok or not ItemModelHelper then return nil end
+                local resolveOk, model = pcall(function()
+                    return ItemModelHelper.promise_download_item_model(toy.id):expect()
+                end)
+                if not resolveOk or not model then return nil end
+                -- Unanchor all parts
+                for _, p in ipairs(model:GetDescendants()) do
+                    if p:IsA("BasePart") then
+                        p.Anchored = false
+                        p.CanCollide = true
+                    end
+                end
+                local char = LocalPlayer.Character
+                if char and char:FindFirstChild("HumanoidRootPart") then
+                    model:SetPrimaryPartCFrame(char.HumanoidRootPart.CFrame * CFrame.new(0, 0, -3))
+                end
+                model.Parent = workspace
+                game:GetService("Debris"):AddItem(model, 30)
+                return model
+            end
+        }
+    elseif endpoint == "ToolAPI/FireGrapplingHook" then
+        return {
+            FireServer = function() end -- no-op, visual handled client-side by GrapplingHook module
+        }
+    elseif endpoint == "ToolAPI/StickGrapplingHook" then
+        return {
+            FireServer = function() end
+        }
+    elseif endpoint == "ToolAPI/CancelGrapplingHook" then
+        return {
+            FireServer = function() end
+        }
+    elseif endpoint == "ToolAPI/ServerUseTool" then
+        return {
+            FireServer = function(_, uniqueId, state, data)
+                -- Check if it's a spawned toy, if so no-op (client handles it)
+                if SpawnedToys[uniqueId] then
+                    return
+                end
+                -- Otherwise pass through to server
+                return OriginalRouterGet("ToolAPI/ServerUseTool"):FireServer(uniqueId, state, data)
+            end
+        }
+    else
+        return OriginalRouterGet(endpoint)
+    end
+end
+
+
+pcall(function()
+    local wrappers = ClientData.get("pet_char_wrappers")
+    if wrappers then
+        for _, wrapper in pairs(wrappers) do
+            if wrapper and wrapper.pet_unique then
+                pcall(function()
+                    OriginalRouterGet("ToolAPI/Unequip"):InvokeServer(wrapper.pet_unique)
+                end)
+            end
+        end
+    end
+end)
+
+
+
